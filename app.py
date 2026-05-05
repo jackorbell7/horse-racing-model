@@ -86,22 +86,29 @@ def parse_rp_string(rp_str):
         course = tokens[1]
         result["surface"] = "Polytrack" if course in {"Lin","Kem","Dun"} else \
                             "Tapeta" if course in {"Wol","Ncs","Sou"} else "Turf"
-    # Distance
+    # Distance — handle "8", "8½", "1m2f", "5f" etc
     if len(tokens) > 2:
-        x = tokens[2].replace("½"," 1/2").replace("¼"," 1/4")
+        raw_dist = tokens[2]
+        # Replace unicode fractions
+        raw_dist = raw_dist.replace("½", ".5").replace("¼", ".25")
         m=0; f=0
         try:
-            if "m" in x:
-                m = float(x[:x.index("m")]) if x[:x.index("m")] else 0
-                after = x[x.index("m")+1:].strip()
+            if "m" in raw_dist:
+                m_part = raw_dist[:raw_dist.index("m")]
+                m = float(m_part) if m_part else 0
+                after = raw_dist[raw_dist.index("m")+1:].strip()
+                if "f" in after:
+                    fp = after[:after.index("f")].strip()
+                    f = float(fp) if fp else 0
+                result["distance"] = m + (f/8)
+            elif "f" in raw_dist:
+                fp = raw_dist[:raw_dist.index("f")].strip()
+                f = float(fp) if fp else 0
+                result["distance"] = f/8
             else:
-                after = x
-            if "f" in after:
-                fp = after[:after.index("f")].strip()
-                if "1/2" in fp: f = float(fp.replace("1/2","").strip() or "0")+0.5
-                elif "1/4" in fp: f = float(fp.replace("1/4","").strip() or "0")+0.25
-                else: f = float(fp) if fp else 0
-            result["distance"] = m+(f/8) if m>0 else f/8
+                # Just a number — treat as furlongs
+                f = float(raw_dist)
+                result["distance"] = f/8
         except:
             pass
     # Ground
@@ -164,9 +171,9 @@ def parse_position_string(pos_str):
 
 def parse_bulk_paste(text):
     """
-    Parse the full Google Sheets paste.
-    Format: rows where col 0 is horse number (or blank for races 2/3)
-    Columns: Number | Race | Date Conditions | Race Conditions | WGT | PosRace Outcome | SP | Jockey | MR | MR OR | TS | RPR
+    Parse Google Sheets paste in format:
+    Horse Name  |  RP String  |  RP String (dup)  |  WGT  |  Position String  |  SP  |  Jockey  |  MR  |  OR  |  TS  |  RPR
+    Horse name only appears on first of the 3 rows. Blank on rows 2 and 3.
     """
     horses = []
     if not text or not text.strip():
@@ -175,70 +182,103 @@ def parse_bulk_paste(text):
     lines = [l for l in text.strip().split("\n") if l.strip()]
     current_horse = None
     current_runs = []
+    horse_number = 0
+
+    def safe_int(v):
+        try:
+            v = str(v).strip()
+            return int(v) if v and v != "-" else None
+        except:
+            return None
 
     for line in lines:
         cols = line.split("\t")
-        # Pad to at least 12 cols
-        while len(cols) < 12:
+        while len(cols) < 11:
             cols.append("")
         cols = [c.strip() for c in cols]
 
-        num_col = cols[0]
-        race_col = cols[1] if len(cols) > 1 else ""
-        rp_str = cols[2] if len(cols) > 2 else ""      # Date Conditions (full RP string)
-        wgt = cols[4] if len(cols) > 4 else ""
-        pos_str = cols[5] if len(cols) > 5 else ""     # PosRace Outcome
-        ts_raw = cols[10] if len(cols) > 10 else ""
-        rpr_raw = cols[11] if len(cols) > 11 else ""
+        first_col = cols[0]
 
-        def safe_int(v):
-            try:
-                v = v.strip()
-                return int(v) if v and v != "-" else None
-            except:
-                return None
+        # Detect if this is a new horse row — first col has text that isn't a date
+        # Dates start with digits (e.g. 11Apr26), horse names start with letters
+        # and don't look like RP strings
+        def is_horse_name(val):
+            if not val: return False
+            # RP strings start with date like "11Apr26" — digits first
+            if re.match(r'^\d{1,2}[A-Z][a-z]{2}\d{2}', val): return False
+            # If it contains letters and doesn't look like a date, it's a name
+            return bool(re.match(r'^[A-Za-z]', val))
 
-        ts = safe_int(ts_raw)
-        rpr = safe_int(rpr_raw)
-
-        # Parse RP string and position
-        parsed_rp = parse_rp_string(rp_str)
-        parsed_pos = parse_position_string(pos_str)
-
-        run = {
-            "date": parsed_rp.get("date"),
-            "surface": parsed_rp.get("surface"),
-            "ground": parsed_rp.get("ground"),
-            "distance": parsed_rp.get("distance"),
-            "class_val": parsed_rp.get("class_val"),
-            "weight": wgt,
-            "position": parsed_pos.get("position"),
-            "runners": parsed_pos.get("runners"),
-            "beaten": parsed_pos.get("beaten"),
-            "ts": ts,
-            "rpr": rpr,
-            "rp_raw": rp_str,
-            "pos_raw": pos_str,
-        }
-
-        # New horse (number in first col)
-        if num_col.isdigit():
+        if is_horse_name(first_col):
+            # Save previous horse
             if current_horse is not None:
                 current_horse["runs"] = current_runs[:3]
                 horses.append(current_horse)
+
+            horse_number += 1
+            # Columns: Name | RP String | RP String dup | WGT | Position | SP | Jockey | MR | OR | TS | RPR
+            rp_str  = cols[1] if len(cols) > 1 else ""
+            wgt     = cols[3] if len(cols) > 3 else ""
+            pos_str = cols[4] if len(cols) > 4 else ""
+            ts_raw  = cols[9]  if len(cols) > 9  else ""
+            rpr_raw = cols[10] if len(cols) > 10 else ""
+
+            parsed_rp  = parse_rp_string(rp_str)
+            parsed_pos = parse_position_string(pos_str)
+
+            run = {
+                "date": parsed_rp.get("date"),
+                "surface": parsed_rp.get("surface"),
+                "ground": parsed_rp.get("ground"),
+                "distance": parsed_rp.get("distance"),
+                "class_val": parsed_rp.get("class_val"),
+                "weight": wgt,
+                "position": parsed_pos.get("position"),
+                "runners": parsed_pos.get("runners"),
+                "beaten": parsed_pos.get("beaten"),
+                "ts": safe_int(ts_raw),
+                "rpr": safe_int(rpr_raw),
+            }
+
             current_horse = {
-                "number": int(num_col),
-                "name": "",
+                "number": horse_number,
+                "name": first_col,
                 "or_rating": None,
                 "odds": "",
                 "stall": None,
                 "weight": wgt,
             }
             current_runs = [run]
+
         else:
-            # Continuation row (race 2 or 3)
-            if current_horse is not None:
-                current_runs.append(run)
+            # Continuation row (race 2 or 3) — first col is blank
+            if current_horse is None:
+                continue
+
+            # Columns: blank | RP String | RP String dup | WGT | Position | SP | Jockey | MR | OR | TS | RPR
+            rp_str  = cols[1] if len(cols) > 1 else ""
+            wgt     = cols[3] if len(cols) > 3 else ""
+            pos_str = cols[4] if len(cols) > 4 else ""
+            ts_raw  = cols[9]  if len(cols) > 9  else ""
+            rpr_raw = cols[10] if len(cols) > 10 else ""
+
+            parsed_rp  = parse_rp_string(rp_str)
+            parsed_pos = parse_position_string(pos_str)
+
+            run = {
+                "date": parsed_rp.get("date"),
+                "surface": parsed_rp.get("surface"),
+                "ground": parsed_rp.get("ground"),
+                "distance": parsed_rp.get("distance"),
+                "class_val": parsed_rp.get("class_val"),
+                "weight": wgt,
+                "position": parsed_pos.get("position"),
+                "runners": parsed_pos.get("runners"),
+                "beaten": parsed_pos.get("beaten"),
+                "ts": safe_int(ts_raw),
+                "rpr": safe_int(rpr_raw),
+            }
+            current_runs.append(run)
 
     # Add last horse
     if current_horse is not None:
